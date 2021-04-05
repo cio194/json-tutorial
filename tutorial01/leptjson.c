@@ -9,11 +9,15 @@
 #include <math.h>
 #include <errno.h>
 #include <string.h>
+#include <ctype.h>
 
 #define EXPECT(c, ch)	do { assert(*c->json == (ch)); c->json++; } while(0)
 
+#define PUTC(c, ch)  do {*(char *)lept_context_push(c, sizeof(char)) = (ch);} while(0)
+#define STRING_ERROR(ret) do { c->top = head; return ret; } while(0)
+
 typedef struct {
-	const char* stack;
+	char* stack;
 	size_t size, top;
 	const char* json;
 } lept_context;
@@ -32,8 +36,9 @@ static void* lept_context_push(lept_context* c, size_t size)
 			c->size = LEPT_PARSE_STACK_INIT_SIZE;
 		while (c->top + size >= c->size)
 			c->size += (c->size >> 1);
-		c->stack = (const char*)realloc(c->stack, c->size);
-		assert(c->stack != NULL);
+		char * char_p = (char*)realloc(c->stack, c->size);
+		assert(char_p != NULL);
+		c->stack = char_p;
 	}
 
 	ret = c->stack + c->top;
@@ -53,6 +58,45 @@ static void lept_parse_whitespace(lept_context* c)
 	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
 		p++;
 	c->json = p;
+}
+
+static const char* lept_parse_hex4(const char* p, unsigned* u)
+{
+	*u = 0;
+	for (int i = 0; i < 4; i++)
+	{
+		char ch = *p++;
+		*u <<= 4;
+		if (ch >= '0' && ch <= '9') *u |= ch - '0';
+		else if (ch >= 'A' && ch <= 'F') *u |= ch - 'A' + 10;
+		else if (ch >= 'a' && ch <= 'f') *u |= ch - 'a' + 10;
+		else return NULL;
+	}
+	return p;
+}
+
+static void  lept_encode_utf8(lept_context* c, unsigned u)
+{
+	// 先将高位压入栈？怎么取数然后解码呢？
+	// 不应该是高位置于栈顶，然后才能根据编码规则实现解码？
+	if (u <= 0x7F)
+		PUTC(c, u & 0xFF);
+	else if (u <= 0x7FF) {
+		PUTC(c, 0xC0 | ((u >> 6) & 0xFF));
+		PUTC(c, 0x80 | (u & 0x3F));
+	}
+	else if (u <= 0xFFFF) {
+		PUTC(c, 0xE0 | ((u >> 12) & 0xFF));
+		PUTC(c, 0x80 | ((u >> 6) & 0x3F));
+		PUTC(c, 0x80 | (u & 0x3F));
+	}
+	else {
+		assert(u <= 0x10FFFF);
+		PUTC(c, 0xF0 | ((u >> 18) & 0xFF));
+		PUTC(c, 0x80 | ((u >> 12) & 0x3F));
+		PUTC(c, 0x80 | ((u >> 6) & 0x3F));
+		PUTC(c, 0x80 | (u & 0x3F));
+	}
 }
 
 static int lept_parse_literal(lept_context* c, lept_value* v, const char* literal, lept_type type)
@@ -173,9 +217,9 @@ static int lept_parse_number(lept_context* c, lept_value* v) {
 	return LEPT_PARSE_OK;
 }
 
-#define PUTC(c, ch)  do {*(char *)lept_context_push(c, sizeof(char)) = (ch);} while(0)
 static int lept_parse_string(lept_context* c, lept_value* v)
 {
+	unsigned u;
 	size_t head = c->top, len;
 	const char* p;
 	EXPECT(c, '"');
@@ -193,8 +237,9 @@ static int lept_parse_string(lept_context* c, lept_value* v)
 			return LEPT_PARSE_OK;
 		case '\0':
 			// bad string (missing quotation mark)
-			c->top = head;
-			return LEPT_PARSE_MISS_QUOTATION_MARK;
+			/*c->top = head;
+			return LEPT_PARSE_MISS_QUOTATION_MARK;*/
+			STRING_ERROR(LEPT_PARSE_MISS_QUOTATION_MARK);
 		case '\\':
 			switch (*(p++))
 			{
@@ -206,9 +251,39 @@ static int lept_parse_string(lept_context* c, lept_value* v)
 			case 'n':  PUTC(c, '\n'); break;
 			case 'r':  PUTC(c, '\r'); break;
 			case 't':  PUTC(c, '\t'); break;
+			case 'u':
+				p = lept_parse_hex4(p, &u);
+				if (p == NULL)
+					STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_HEX);
+				if (0xD800 <= u && 0xDBFF >= u)  // surrogate pair
+				{
+					if (*(p++) != '\\')
+					{
+						STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_SURROGATE);
+					}
+					if (*(p++) != 'u')
+					{
+						STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_SURROGATE);
+					}
+					unsigned u2;
+					p = lept_parse_hex4(p, &u2);
+					if (p == NULL)
+					{
+						STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_HEX);
+					}
+					if (0xDC00 > u2 || 0xDFFF < u2)
+					{
+						STRING_ERROR(LEPT_PARSE_INVALID_UNICODE_SURROGATE);
+					}
+					// codepoint = 0x1000 + (H - 0xD800) * 0x400 + (L - 0xDC00)
+					u = 0x10000 + ((u - 0xD800) << 10) + (u2 - 0xDC00);
+				}
+				lept_encode_utf8(c, u);
+				break;
 			default:
-				c->top = head;
-				return LEPT_PARSE_INVALID_STRING_ESCAPE;
+				/*c->top = head;
+				return LEPT_PARSE_INVALID_STRING_ESCAPE;*/
+				STRING_ERROR(LEPT_PARSE_INVALID_STRING_ESCAPE);
 				break;
 			}
 			break;
@@ -216,8 +291,9 @@ static int lept_parse_string(lept_context* c, lept_value* v)
 			// normal char
 			if ((unsigned char)ch < 0x20)
 			{
-				c->top = head;
-				return LEPT_PARSE_INVALID_STRING_CHAR;
+				// c->top = head;
+				// return LEPT_PARSE_INVALID_STRING_CHAR;
+				STRING_ERROR(LEPT_PARSE_INVALID_STRING_CHAR);
 			}
 			PUTC(c, ch);
 		}
